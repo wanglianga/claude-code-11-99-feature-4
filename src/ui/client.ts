@@ -42,8 +42,8 @@ export class WorkerClient {
     });
   }
 
-  async cmd(cmd: Command, role: Role): Promise<CmdResult> {
-    const m = await this.call('cmd', { cmd, role });
+  async cmd(cmd: Command, role: Role, volunteerId?: string): Promise<CmdResult> {
+    const m = await this.call('cmd', { cmd, role, volunteerId });
     return m.result as CmdResult;
   }
 

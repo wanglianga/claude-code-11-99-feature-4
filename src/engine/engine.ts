@@ -1,12 +1,52 @@
 import { fmtDateTime, fmtTime } from './format';
+import {
+  COUNTER_FULL_NAME,
+  ROSTER_STRATEGY_LABEL,
+  actualIntervals,
+  attendanceAt,
+  attendanceEndAt,
+  availableAt,
+  availableOver,
+  blockIntervals,
+  clampIntervals,
+  counterById,
+  counterSuspended,
+  counterWindowContaining,
+  coverageReport,
+  coversRange,
+  fmtSlot,
+  gapsWithin,
+  generateFixedCrossSkilled,
+  generateShortShift,
+  mergeIntervals,
+  openAttendanceOf,
+  overlaps,
+  plannedIntervals,
+  rosterConflicts,
+  shiftEffectiveIntervals,
+  shiftIssues,
+  skillActiveAt,
+  skillActiveOver,
+  volunteerBusyOver,
+  volunteerById,
+  windowEndAt,
+  fmtRange,
+  availabilityEndAt,
+} from './roster';
 import { seedState } from './seed';
 import type {
   Assignment,
+  Attendance,
+  Booking,
+  BookingStatus,
   CmdCtx,
   CmdOutcome,
   Command,
   ContactTask,
+  CounterId,
   Family,
+  Handover,
+  Interval,
   PendingConfirmation,
   PromiseStatus,
   ProtectionStrategy,
@@ -14,17 +54,25 @@ import type {
   ReturnPromise,
   Role,
   Room,
+  RosterPlan,
   ShelterState,
+  Shift,
+  Volunteer,
 } from './types';
 
 /** 本地模拟适配器的异步确认时延（真实毫秒） */
 export const CHECKIN_DELAY_REAL_MS = 1200;
 export const CHECKOUT_DELAY_REAL_MS = 1500;
 
+/** 预约自动转为等待态的原因前缀（用于覆盖恢复时自动复原） */
+export const AUTO_WAIT_PREFIX = '[自动] ';
+
 export const ROLE_LABEL: Record<Role, string> = {
   receptionist: '接待员',
   duty: '楼层值班员',
   bed_manager: '床位管理员',
+  coordinator: '排班协调员',
+  volunteer: '志愿者',
 };
 
 export const FAMILY_STATUS_LABEL: Record<Family['status'], string> = {
@@ -63,6 +111,24 @@ const PERMS: Record<Command['type'], Role[] | 'any'> = {
   AdvanceClock: 'any',
   ResetDemo: 'any',
   FinalizeDue: 'any',
+  // 排班与开台
+  RegisterVolunteer: ['coordinator'],
+  AddVolunteerBlock: ['coordinator'],
+  RevokeSkill: ['coordinator'],
+  RestoreSkill: ['coordinator'],
+  GenerateRoster: ['coordinator'],
+  ManualAssignShift: ['coordinator'],
+  CancelShift: ['coordinator'],
+  OpenCounterWindow: ['coordinator'],
+  SignIn: ['volunteer', 'coordinator'],
+  SignOut: ['volunteer', 'coordinator'],
+  RequestHandover: ['coordinator', 'volunteer'],
+  ConfirmHandover: ['coordinator', 'volunteer'],
+  CancelHandover: ['coordinator'],
+  CreateBooking: ['receptionist', 'coordinator'],
+  RescheduleBooking: ['receptionist', 'coordinator'],
+  CancelBooking: ['receptionist', 'coordinator'],
+  ServeBooking: ['receptionist', 'duty', 'volunteer'],
 };
 
 // ---------------------------------------------------------------------------
@@ -331,6 +397,87 @@ export function checkInvariants(state: ShelterState): InvariantResult[] {
     detail: moveBad.length ? `异常：${moveBad.join('、')}` : '在住家庭的入住记录与其房间一致，系统不做自动搬动',
   });
 
+  // ---- 排班与开台核对 ----
+  const multiCounter: string[] = [];
+  for (const a of state.attendances.filter((x) => x.signedOutAt === undefined)) {
+    const anyoneElse = state.attendances.find(
+      (x) =>
+        x.id !== a.id &&
+        x.volunteerId === a.volunteerId &&
+        x.counter !== a.counter &&
+        x.signedOutAt === undefined,
+    );
+    if (anyoneElse) multiCounter.push(`${volunteerById(state, a.volunteerId)?.name ?? a.volunteerId} 同时在 A/B 在岗`);
+  }
+  results.push({
+    name: '一人不同时支撑两个柜台',
+    ok: multiCounter.length === 0,
+    detail: multiCounter.join('；') || '所有在岗出勤均为单一柜台；联动换岗通过离岗+签到完成',
+  });
+
+  const planBad: string[] = [];
+  for (const c of state.counters) {
+    for (const w of c.windows) {
+      const gaps = gapsWithin(plannedIntervals(state, c.id), w.start, w.end);
+      if (gaps.length) planBad.push(`${c.name} 计划缺口 ${gaps.map(fmtRange).join('、')}`);
+    }
+  }
+  results.push({
+    name: '计划覆盖按实际时间区间检验',
+    ok: planBad.length === 0,
+    detail: planBad.join('；') || '两柜台每个开放窗口内均有计划班次区间衔接，无空窗（不按总工时相加）',
+  });
+
+  const conflictBad = rosterConflicts(state).map((c) => c.message);
+  results.push({
+    name: '班次无技能/时间冲突',
+    ok: conflictBad.length === 0,
+    detail: conflictBad.join('；') || '全部计划班次在技能有效、可用、无休息任务重叠、无跨柜台重叠的区间内',
+  });
+
+  const actualBad = coverageReport(state)
+    .map((r) => {
+      // 只核对“当前时刻”是否有人实际在岗；未来时段由计划覆盖与页面覆盖条展示
+      const c = counterById(state, r.counter);
+      const now = state.virtualNow;
+      const inside = !!c && c.windows.some((w) => w.start <= now && now < w.end);
+      if (!inside) return '';
+      const covered = actualIntervals(state, r.counter).some((i) => i.start <= now && now < i.end);
+      return covered ? '' : `${r.name} 当前时刻无实际签到在岗者`;
+    })
+    .filter(Boolean);
+  results.push({
+    name: '实际覆盖（当前时刻）',
+    ok: actualBad.length === 0,
+    detail: actualBad.join('；') || '两柜台当前时刻均有实际签到在岗者',
+  });
+
+  const pendingMulti = state.handovers.filter((h) => h.status === 'pending').length;
+  const dupPending = (['A', 'B'] as CounterId[]).filter(
+    (c) => state.handovers.filter((h) => h.counter === c && h.status === 'pending').length > 1,
+  );
+  const dupEffective = state.handovers.filter(
+    (h) =>
+      h.status === 'effective' &&
+      state.handovers.some(
+        (o) =>
+          o.id !== h.id &&
+          o.status === 'effective' &&
+          o.counter === h.counter &&
+          o.effectiveAt === h.effectiveAt,
+      ),
+  );
+  results.push({
+    name: '交接唯一生效',
+    ok: dupPending.length === 0 && dupEffective.length === 0,
+    detail:
+      dupPending.length || dupEffective.length
+        ? `异常：${[...dupPending.map((c) => `${c} 柜台重复待确认`), ...dupEffective.map((h) => `交接 ${h.id} 重复生效`)].join('；')}`
+        : pendingMulti
+          ? `${pendingMulti} 份交接待确认；每柜台同时最多一份待确认，双方确认只形成一份生效交接`
+          : '每柜台同时至多一份待确认交接；生效交接唯一',
+  });
+
   return results;
 }
 
@@ -397,6 +544,40 @@ function summarize(state: ShelterState, cmd: Command): string {
       return '重置演示数据';
     case 'FinalizeDue':
       return '异步确认结算';
+    case 'RegisterVolunteer':
+      return `登记志愿者「${cmd.input.name}」`;
+    case 'AddVolunteerBlock':
+      return `登记${cmd.kind === 'rest' ? '休息' : '临时任务'}区间`;
+    case 'RevokeSkill':
+      return `撤销志愿者技能（${COUNTER_FULL_NAME[cmd.counter]}）`;
+    case 'RestoreSkill':
+      return `恢复志愿者技能（${COUNTER_FULL_NAME[cmd.counter]}）`;
+    case 'GenerateRoster':
+      return `生成班表（${ROSTER_STRATEGY_LABEL[cmd.strategy]}）`;
+    case 'ManualAssignShift':
+      return `手工排班 ${COUNTER_FULL_NAME[cmd.counter]}`;
+    case 'CancelShift':
+      return '取消班次';
+    case 'OpenCounterWindow':
+      return `开放柜台窗口（${COUNTER_FULL_NAME[cmd.counter]}）`;
+    case 'SignIn':
+      return `志愿者签到（${COUNTER_FULL_NAME[cmd.counter]}）`;
+    case 'SignOut':
+      return '志愿者离岗';
+    case 'RequestHandover':
+      return `发起交接（${COUNTER_FULL_NAME[cmd.counter]}）`;
+    case 'ConfirmHandover':
+      return `确认交接（${cmd.side === 'outgoing' ? '交班方' : '接班方'}）`;
+    case 'CancelHandover':
+      return '取消交接';
+    case 'CreateBooking':
+      return `开放预约（${COUNTER_FULL_NAME[cmd.counter]}）`;
+    case 'RescheduleBooking':
+      return '改约';
+    case 'CancelBooking':
+      return '取消预约';
+    case 'ServeBooking':
+      return '办理预约';
   }
 }
 
@@ -434,6 +615,8 @@ export function applyCommand(prev: ShelterState, cmd: Command, ctx: CmdCtx): Cmd
   const error = dispatch(state, cmd, ctx, R);
   // 每次变更后重核所有有效草稿：失效草稿保留输入并说明冲突
   revalidateDrafts(state, R);
+  // 覆盖/预约口径同步：名义班表不等实际在岗，覆盖中断的预约转入等待，恢复后复原
+  syncBookings(state, R);
 
   const mutated = receipts.length > 0 || !!error;
   if (!mutated) return { state: prev, receipts: [], changed: false };
@@ -482,6 +665,40 @@ function dispatch(state: ShelterState, cmd: Command, ctx: CmdCtx, R: ReceiptSink
       return hAdvanceClock(state, cmd, R);
     case 'FinalizeDue':
       return hFinalizeDue(state, ctx, R);
+    case 'RegisterVolunteer':
+      return hRegisterVolunteer(state, cmd, R);
+    case 'AddVolunteerBlock':
+      return hAddVolunteerBlock(state, cmd, R);
+    case 'RevokeSkill':
+      return hRevokeSkill(state, cmd, R);
+    case 'RestoreSkill':
+      return hRestoreSkill(state, cmd, R);
+    case 'GenerateRoster':
+      return hGenerateRoster(state, cmd, R);
+    case 'ManualAssignShift':
+      return hManualAssignShift(state, cmd, R);
+    case 'CancelShift':
+      return hCancelShift(state, cmd, R);
+    case 'OpenCounterWindow':
+      return hOpenCounterWindow(state, cmd, R);
+    case 'SignIn':
+      return hSignIn(state, cmd, ctx, R, state.virtualNow);
+    case 'SignOut':
+      return hSignOut(state, cmd, ctx, R);
+    case 'RequestHandover':
+      return hRequestHandover(state, cmd, R);
+    case 'ConfirmHandover':
+      return hConfirmHandover(state, cmd, ctx, R);
+    case 'CancelHandover':
+      return hCancelHandover(state, cmd, R);
+    case 'CreateBooking':
+      return hCreateBooking(state, cmd, R);
+    case 'RescheduleBooking':
+      return hRescheduleBooking(state, cmd, R);
+    case 'CancelBooking':
+      return hCancelBooking(state, cmd, R);
+    case 'ServeBooking':
+      return hServeBooking(state, cmd, R);
     default:
       return '未知命令';
   }
@@ -964,4 +1181,708 @@ function revalidateDrafts(state: ShelterState, R: ReceiptSink): void {
       ]);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// 柜台排班与开台：命令处理器
+// ---------------------------------------------------------------------------
+
+function hRegisterVolunteer(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'RegisterVolunteer' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const name = cmd.input.name.trim();
+  if (!name) return '志愿者姓名不能为空';
+  if (state.volunteers.some((v) => v.name === name)) return `志愿者「${name}」已存在`;
+  const skills = [...new Set(cmd.input.skills)].filter((c): c is CounterId => c === 'A' || c === 'B');
+  if (skills.length === 0) return '至少需要一项已核准岗位技能';
+  const available = mergeIntervals(cmd.input.available);
+  if (available.length === 0) return '请登记至少一个可用时间区间';
+  const v: Volunteer = { id: uid(), name, skills, available };
+  state.volunteers.push(v);
+  R('volunteer_registered', `已登记志愿者：${name}`, [
+    `已核准技能：${skills.map((c) => COUNTER_FULL_NAME[c]).join('、')}`,
+    `可用时间：${available.map(fmtRange).join('、')}`,
+    '可用时间只是排班前提；是否实际在岗以签到出勤为准',
+  ]);
+  return undefined;
+}
+
+function hAddVolunteerBlock(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'AddVolunteerBlock' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const v = volunteerById(state, cmd.volunteerId);
+  if (!v) return '志愿者不存在';
+  if (cmd.end <= cmd.start) return '区间结束须晚于开始';
+  state.blocks.push({
+    id: uid(),
+    volunteerId: v.id,
+    kind: cmd.kind,
+    start: cmd.start,
+    end: cmd.end,
+    label: cmd.label.trim() || (cmd.kind === 'rest' ? '休息' : '临时任务'),
+  });
+  const affected = state.shifts
+    .filter((s) => s.status === 'planned' && s.volunteerId === v.id && overlaps(s, { start: cmd.start, end: cmd.end }))
+    .map((s) => `${COUNTER_FULL_NAME[s.counter]} ${fmtRange(s)}`);
+  R('volunteer_block_added', `已登记${cmd.kind === 'rest' ? '休息' : '临时任务'}：${v.name} ${fmtRange(cmd)}`, [
+    ...(affected.length ? [`受影响的计划班次：${affected.join('、')}（覆盖按区间扣除，需安排替班）`] : []),
+    '该区间内不再计入计划覆盖，也不能签到支撑该柜台',
+  ]);
+  return undefined;
+}
+
+function hRevokeSkill(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'RevokeSkill' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const v = volunteerById(state, cmd.volunteerId);
+  if (!v) return '志愿者不存在';
+  if (!v.skills.includes(cmd.counter)) return `该志愿者本不具备${COUNTER_FULL_NAME[cmd.counter]}技能`;
+  const at = cmd.at ?? state.virtualNow;
+  if (state.skillRevocations.some((r) => r.volunteerId === v.id && r.counter === cmd.counter && r.to === undefined)) {
+    return `该志愿者的${COUNTER_FULL_NAME[cmd.counter]}技能已处于撤销状态`;
+  }
+  state.skillRevocations.push({ id: uid(), volunteerId: v.id, counter: cmd.counter, from: at });
+  const affected = state.shifts
+    .filter(
+      (s) => s.status === 'planned' && s.volunteerId === v.id && s.counter === cmd.counter && s.end > at,
+    )
+    .map((s) => `${fmtRange(s)}`);
+  R('skill_revoked', `技能资格已撤销：${v.name} · ${COUNTER_FULL_NAME[cmd.counter]}（自 ${fmtDateTime(at)}）`, [
+    ...(affected.length ? [`后续计划班次失去资格：${affected.join('、')}，需重新排班`] : []),
+    '撤销不删除既有班次与出勤记录；覆盖按区间扣除，已发生的服务不回撤',
+  ]);
+  return undefined;
+}
+
+function hRestoreSkill(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'RestoreSkill' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const v = volunteerById(state, cmd.volunteerId);
+  if (!v) return '志愿者不存在';
+  const at = cmd.at ?? state.virtualNow;
+  const open = state.skillRevocations.filter(
+    (r) => r.volunteerId === v.id && r.counter === cmd.counter && r.to === undefined,
+  );
+  if (!open.length) return '该技能没有处于撤销状态';
+  for (const r of open) r.to = at;
+  R('skill_restored', `技能资格已恢复：${v.name} · ${COUNTER_FULL_NAME[cmd.counter]}（自 ${fmtDateTime(at)}）`, [
+    '恢复仅对恢复时刻之后的时段生效，此前缺岗区间仍记为缺口',
+  ]);
+  return undefined;
+}
+
+function hGenerateRoster(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'GenerateRoster' }>,
+  R: ReceiptSink,
+): string | undefined {
+  if (cmd.windowEnd <= cmd.windowStart) return '排班窗口结束须晚于开始';
+  const counters = state.counters;
+  for (const c of counters) {
+    const covering = c.windows.some((w) => w.start <= cmd.windowStart && cmd.windowEnd <= w.end);
+    if (!covering) return `排班窗口须落在柜台开放区间内（${c.name}）`;
+  }
+  const gen =
+    cmd.strategy === 'fixed_crossskilled'
+      ? generateFixedCrossSkilled(state, cmd.windowStart, cmd.windowEnd)
+      : generateShortShift(state, cmd.windowStart, cmd.windowEnd);
+  if (gen.error) return gen.error;
+  if (gen.drafts.length === 0) return '未能生成任何班次';
+  // 新方案替换同窗口内的旧计划班次（出勤记录不受影响）
+  for (const s of state.shifts) {
+    if (s.status === 'planned' && s.start < cmd.windowEnd && cmd.windowStart < s.end) s.status = 'cancelled';
+  }
+  const plan: RosterPlan = {
+    id: uid(),
+    strategy: cmd.strategy,
+    windowStart: cmd.windowStart,
+    windowEnd: cmd.windowEnd,
+    createdAt: state.virtualNow,
+    status: 'active',
+  };
+  state.plans.push(plan);
+  const drafts = [...gen.drafts].sort((a, b) => a.start - b.start || (a.counter < b.counter ? -1 : 1));
+  for (const d of drafts) {
+    state.shifts.push({
+      id: uid(),
+      volunteerId: d.volunteerId,
+      counter: d.counter,
+      start: d.start,
+      end: d.end,
+      kind: d.kind,
+      planId: plan.id,
+      status: 'planned',
+    });
+  }
+  const nameOf = (id: string) => volunteerById(state, id)?.name ?? id;
+  const lines = drafts.map(
+    (d) =>
+      `${fmtRange(d)} ${COUNTER_FULL_NAME[d.counter]}：${nameOf(d.volunteerId)}（${d.kind === 'main' ? '主班' : '替休'}）`,
+  );
+  for (const n of gen.notes) lines.push(n);
+  R(
+    'roster_generated',
+    `已生成班表：${ROSTER_STRATEGY_LABEL[cmd.strategy]}（${fmtRange({ start: cmd.windowStart, end: cmd.windowEnd })}）`,
+    lines,
+  );
+  return undefined;
+}
+
+function hManualAssignShift(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'ManualAssignShift' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const v = volunteerById(state, cmd.volunteerId);
+  if (!v) return '志愿者不存在';
+  if (cmd.end <= cmd.start) return '班次结束须晚于开始';
+  const counter = counterById(state, cmd.counter);
+  if (!counter) return '柜台不存在';
+  if (!counterWindowContaining(counter, cmd.start, cmd.end)) return '班次须落在柜台开放窗口内';
+  if (!v.skills.includes(cmd.counter)) return `${v.name} 不具备${COUNTER_FULL_NAME[cmd.counter]}技能`;
+  if (!availableOver(v, cmd.start, cmd.end)) return `${v.name} 的登记可用时间未覆盖该班次`;
+  if (blockIntervals(state, v.id).some((b) => overlaps(b, { start: cmd.start, end: cmd.end }))) {
+    return `${v.name} 在该时段有休息或临时任务，不能排班`;
+  }
+  const plan =
+    state.plans.find(
+      (p) => p.status === 'active' && p.windowStart <= cmd.start && cmd.end <= p.windowEnd,
+    ) ??
+    (() => {
+      const p: RosterPlan = {
+        id: uid(),
+        strategy: 'manual',
+        windowStart: cmd.start,
+        windowEnd: cmd.end,
+        createdAt: state.virtualNow,
+        status: 'active',
+      };
+      state.plans.push(p);
+      return p;
+    })();
+  const shift: Shift = {
+    id: uid(),
+    volunteerId: v.id,
+    counter: cmd.counter,
+    start: cmd.start,
+    end: cmd.end,
+    kind: 'main',
+    planId: plan.id,
+    status: 'planned',
+  };
+  state.shifts.push(shift);
+  const issue = volunteerBusyOver(state, v.id, cmd.start, cmd.end, shift.id);
+  const skillIssue = !skillActiveOver(state, v, cmd.counter, cmd.start, cmd.end);
+  R('shift_assigned', `手工排班：${v.name} → ${COUNTER_FULL_NAME[cmd.counter]} ${fmtRange(cmd)}`, [
+    ...(issue ? [`⚠ 冲突：${issue}`] : []),
+    ...(skillIssue ? ['⚠ 冲突：该时段技能资格已撤销'] : []),
+    '计划班次不等于实际在岗；需志愿者签到后才会计入实际覆盖',
+  ]);
+  return undefined;
+}
+
+function hCancelShift(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'CancelShift' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const s = state.shifts.find((x) => x.id === cmd.shiftId);
+  if (!s || s.status !== 'planned') return '班次不存在或已取消';
+  s.status = 'cancelled';
+  const v = volunteerById(state, s.volunteerId);
+  R('shift_cancelled', `已取消计划班次：${v?.name ?? s.volunteerId} · ${COUNTER_FULL_NAME[s.counter]} ${fmtRange(s)}`, [
+    '实际出勤记录不受影响：已发生的服务保留，覆盖按出勤区间计算',
+  ]);
+  return undefined;
+}
+
+function hSignIn(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'SignIn' }>,
+  ctx: CmdCtx,
+  R: ReceiptSink,
+  now: number,
+): string | undefined {
+  const v = volunteerById(state, cmd.volunteerId);
+  if (!v) return '志愿者不存在';
+  if (ctx.role === 'volunteer' && ctx.volunteerId && ctx.volunteerId !== v.id) return '志愿者只能为本人签到';
+  const counter = counterById(state, cmd.counter);
+  if (!counter) return '柜台不存在';
+  const at = cmd.at ?? now;
+  if (at < now - 5 * 60_000) return '签到时间早于当前时间过多，请检查';
+  if (!skillActiveAt(state, v, cmd.counter, at)) return `${v.name} 在此刻不具备${COUNTER_FULL_NAME[cmd.counter]}有效技能`;
+  if (openAttendanceOf(state, v.id)) return `${v.name} 已在岗（一人不能同时支撑两个柜台），请先办理离岗`;
+  const inside = counter.windows.some((w) => w.start <= at && at < w.end);
+  if (!inside) return `柜台当前不在开放时间内，不能签到`;
+  const shift = state.shifts.find(
+    (s) =>
+      s.status === 'planned' &&
+      s.volunteerId === v.id &&
+      s.counter === cmd.counter &&
+      s.start <= at &&
+      at < s.end,
+  );
+  const plannedEndAt = shift
+    ? shift.end
+    : Math.min(
+        availabilityEndAt(v, at) ?? counter.windows.find((w) => w.start <= at && at < w.end)!.end,
+        windowEndAt(counter, at) ?? at,
+      );
+  const lateSignIn = !!shift && at > shift.start + 5 * 60_000;
+  const a: Attendance = {
+    id: uid(),
+    volunteerId: v.id,
+    counter: cmd.counter,
+    signedInAt: at,
+    plannedEndAt,
+    shiftId: shift?.id,
+    lateSignIn,
+  };
+  state.attendances.push(a);
+  const otherFree = state.attendances.some(
+    (x) => x.counter === cmd.counter && x.id !== a.id && x.signedInAt <= at && at < attendanceEndAt(state, x),
+  );
+  R(
+    'sign_in',
+    `签到：${v.name} → ${COUNTER_FULL_NAME[cmd.counter]}（${fmtTime(at)}）`,
+    [
+      shift
+        ? `对应计划班次 ${fmtRange(shift)}${lateSignIn ? '；迟到签到，班次开始至签到时刻记为实际缺口' : ''}`
+        : '无对应计划班次：按实际可用时间在岗，作为临时补位',
+      otherFree ? '提示：该柜台此刻已有他人在岗（允许交接重叠，实际覆盖按并集计算）' : '实际覆盖自签到时刻开始',
+    ],
+  );
+  return undefined;
+}
+
+function hSignOut(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'SignOut' }>,
+  ctx: CmdCtx,
+  R: ReceiptSink,
+): string | undefined {
+  const a = state.attendances.find((x) => x.id === cmd.attendanceId);
+  if (!a) return '出勤记录不存在';
+  if (a.signedOutAt !== undefined) return '该出勤已办理离岗';
+  if (ctx.role === 'volunteer' && ctx.volunteerId && ctx.volunteerId !== a.volunteerId)
+    return '志愿者只能为本人办理离岗';
+  const v = volunteerById(state, a.volunteerId);
+  const at = cmd.at;
+  if (at < a.signedInAt) return '离岗时间不能早于签到时间';
+  const lateReport = cmd.reportedAt !== undefined && cmd.reportedAt > at;
+  a.signedOutAt = at;
+  a.lateReport = lateReport;
+  a.reportedAt = cmd.reportedAt;
+  a.signOutNote = cmd.note;
+  const suspended = counterSuspended(state, a.counter);
+  const person = v?.name ?? a.volunteerId;
+  const lines = [
+    lateReport
+      ? `离岗回执晚到：按实际离岗时间 ${fmtTime(at)} 修订缺岗区间（回执 ${fmtTime(cmd.reportedAt!)} 到达）`
+      : `实际覆盖至 ${fmtTime(at)} 结束`,
+    '已发生的服务不回撤：历史出勤与覆盖记录保留',
+  ];
+  if (suspended) lines.push(`⚠ ${COUNTER_FULL_NAME[a.counter]} 当前无人实际在岗，已暂停放号；请安排直接替补或联动换岗`);
+  R('sign_out', `离岗：${person} 离开 ${COUNTER_FULL_NAME[a.counter]}（实际离岗 ${fmtTime(at)}）`, lines);
+  return undefined;
+}
+
+function hRequestHandover(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'RequestHandover' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const to = volunteerById(state, cmd.toVolunteerId);
+  if (!to) return '接班人不存在';
+  const now = state.virtualNow;
+  const current = attendanceAt(state, cmd.counter, now);
+  const otherCounter: CounterId = cmd.counter === 'A' ? 'B' : 'A';
+  let fill: Volunteer | undefined;
+  if (cmd.linkedSwap) {
+    if (current && current.volunteerId === to.id) return '接班人已在当前柜台';
+    if (!openAttendanceOf(state, to.id, otherCounter))
+      return `${to.name} 当前并未在${COUNTER_FULL_NAME[otherCounter]}在岗，不能联动换岗；请使用直接替补`;
+  }  if (!to.skills.includes(cmd.counter)) return `${to.name} 不具备${COUNTER_FULL_NAME[cmd.counter]}技能`;
+  if (!skillActiveAt(state, to, cmd.counter, now)) return `${to.name} 的${COUNTER_FULL_NAME[cmd.counter]}技能资格当前无效`;
+  if (!availableAt(to, now)) return `${to.name} 当前不在登记可用时间内`;
+  if (state.blocks.some((b) => b.volunteerId === to.id && b.start <= now && now < b.end))
+    return `${to.name} 当前处于休息或临时任务中`;
+  const busyElsewhere = openAttendanceOf(state, to.id);
+  // 直接替补若调走另一柜台的在岗者，是允许的，但会在生效时结束原柜台出勤（原柜台转暂停放号）；
+  // 如希望两处都有人，应改用联动换岗并指定补位者。
+  if (busyElsewhere && busyElsewhere.counter === cmd.counter && !cmd.linkedSwap)
+    return `${to.name} 已在${COUNTER_FULL_NAME[cmd.counter]}在岗`;
+  if (cmd.linkedSwap) {
+    if (!cmd.fillVolunteerId)
+      return '联动换岗需同时指定原柜台的补位者，否则原柜台将无人；如不补位请使用直接替补';
+    fill = volunteerById(state, cmd.fillVolunteerId);
+    if (!fill) return '补位志愿者不存在';
+    if (fill.id === to.id || (current && fill.id === current.volunteerId)) return '补位者不能是参与换岗的本人';
+    if (!fill.skills.includes(otherCounter)) return `${fill.name} 不具备${COUNTER_FULL_NAME[otherCounter]}技能`;
+    if (!skillActiveAt(state, fill, otherCounter, now)) return `${fill.name} 的补位技能资格当前无效`;
+    if (!availableAt(fill, now)) return `${fill.name} 当前不在登记可用时间内`;
+    if (state.blocks.some((b) => b.volunteerId === fill!.id && b.start <= now && now < b.end))
+      return `${fill.name} 当前处于休息或临时任务中`;
+    if (openAttendanceOf(state, fill.id)) return `${fill.name} 已在岗，不能同时支撑两个柜台`;
+  }
+  if (state.handovers.some((h) => h.counter === cmd.counter && h.status === 'pending'))
+    return `${COUNTER_FULL_NAME[cmd.counter]} 已有待确认交接，请先完成或取消`;
+  const h: Handover = {
+    id: uid(),
+    counter: cmd.counter,
+    fromVolunteerId: current?.volunteerId,
+    toVolunteerId: to.id,
+    linkedSwap: cmd.linkedSwap,
+    fillVolunteerId: fill?.id,
+    requestedAt: now,
+    status: 'pending',
+    note: cmd.linkedSwap
+      ? `联动换岗：${to.name} 从${COUNTER_FULL_NAME[otherCounter]}调守${COUNTER_FULL_NAME[cmd.counter]}，${fill!.name} 补位${COUNTER_FULL_NAME[otherCounter]}`
+      : current
+        ? '直接替补'
+        : '柜台无人·直接替补',
+  };
+  state.handovers.push(h);
+  const fromName = current ? volunteerById(state, current.volunteerId)?.name ?? current.volunteerId : '（无人）';
+  R(
+    'handover_requested',
+    `已发起交接：${COUNTER_FULL_NAME[cmd.counter]} ${fromName} → ${to.name}（${h.note}）`,
+    [
+      '交接需交班方与接班方双方确认后才生效；生效前该柜台暂停放号',
+      '已有预约转入等待，不继续报“可办理”',
+    ],
+  );
+  return undefined;
+}
+
+function hConfirmHandover(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'ConfirmHandover' }>,
+  ctx: CmdCtx,
+  R: ReceiptSink,
+): string | undefined {
+  const h = state.handovers.find((x) => x.id === cmd.handoverId);
+  if (!h) return '交接不存在';
+  if (h.status === 'effective') return '该交接已生效（重复确认不会产生第二份交接）';
+  if (h.status !== 'pending') return '该交接当前状态不能确认';
+  if (
+    ctx.role === 'volunteer' &&
+    ctx.volunteerId &&
+    ctx.volunteerId !== h.toVolunteerId &&
+    ctx.volunteerId !== h.fromVolunteerId
+  ) {
+    return '志愿者只能确认与本人相关的交接';
+  }
+  const now = state.virtualNow;
+  if (cmd.side === 'outgoing') {
+    if (!h.fromVolunteerId) return '该柜台本就无人，无需交班方确认，请由接班方确认';
+    if (h.outgoingConfirmedAt !== undefined) return '交班方已确认，等待接班方确认';
+    h.outgoingConfirmedAt = now;
+  } else {
+    if (h.incomingConfirmedAt !== undefined) return '接班方已确认，等待交班方确认';
+    h.incomingConfirmedAt = now;
+  }
+  const bothConfirmed =
+    h.fromVolunteerId === undefined || (h.outgoingConfirmedAt !== undefined && h.incomingConfirmedAt !== undefined);
+  if (!bothConfirmed) {
+    R('handover_confirmed_side', `交接单方确认：${COUNTER_FULL_NAME[h.counter]}（${cmd.side === 'outgoing' ? '交班方' : '接班方'}）`, [
+      '等待另一方确认；柜台在交接生效前保持暂停放号',
+    ]);
+    return undefined;
+  }
+  // 双方确认（或柜台本就无人交班）→ 交接生效（只会形成一份生效交接）
+  const to = volunteerById(state, h.toVolunteerId)!;
+  const endAtFor = (v: Volunteer, c: CounterId) =>
+    Math.min(availabilityEndAt(v, now) ?? Infinity, windowEndAt(counterById(state, c)!, now) ?? now);
+  let vacatedCounter: CounterId | undefined;
+  const otherCounter: CounterId = h.counter === 'A' ? 'B' : 'A';
+  if (h.linkedSwap) {
+    // 联动换岗：接班人离开原柜台调守本柜台，补位者接手原柜台；原柜台在岗者同时离岗
+    const incomingExisting = openAttendanceOf(state, to.id, otherCounter);
+    if (!incomingExisting) return '联动换岗失败：接班人已不在原柜台在岗，请改为直接替补';
+    const fill = h.fillVolunteerId ? volunteerById(state, h.fillVolunteerId) : undefined;
+    if (!fill) return '联动换岗失败：缺少补位者';
+    const outgoingHere = h.fromVolunteerId
+      ? state.attendances.find((a) => a.volunteerId === h.fromVolunteerId && a.signedOutAt === undefined)
+      : undefined;
+    if (outgoingHere) {
+      outgoingHere.signedOutAt = now;
+      outgoingHere.signOutNote = outgoingHere.signOutNote ?? '联动换岗生效时离岗';
+    }
+    incomingExisting.signedOutAt = now;
+    state.attendances.push({
+      id: uid(),
+      volunteerId: to.id,
+      counter: h.counter,
+      signedInAt: now,
+      plannedEndAt: endAtFor(to, h.counter),
+    });
+    state.attendances.push({
+      id: uid(),
+      volunteerId: fill.id,
+      counter: otherCounter,
+      signedInAt: now,
+      plannedEndAt: endAtFor(fill, otherCounter),
+    });
+  } else {
+    const outgoing = h.fromVolunteerId
+      ? state.attendances.find((a) => a.volunteerId === h.fromVolunteerId && a.signedOutAt === undefined)
+      : undefined;
+    if (outgoing) {
+      outgoing.signedOutAt = now;
+      outgoing.signOutNote = outgoing.signOutNote ?? '交接生效时离岗';
+    }
+    // 直接替补若把另一柜台的在岗者调来，该柜台随之暂停放号（一人不能同时支撑两处）
+    const elsewhere = openAttendanceOf(state, to.id);
+    if (elsewhere) {
+      elsewhere.signedOutAt = now;
+      elsewhere.signOutNote = elsewhere.signOutNote ?? '直接替补调岗离岗';
+      vacatedCounter = elsewhere.counter;
+    }
+    state.attendances.push({
+      id: uid(),
+      volunteerId: to.id,
+      counter: h.counter,
+      signedInAt: now,
+      plannedEndAt: endAtFor(to, h.counter),
+    });
+  }
+  h.status = 'effective';
+  h.effectiveAt = now;
+  const fromName = h.fromVolunteerId ? volunteerById(state, h.fromVolunteerId)?.name ?? h.fromVolunteerId : '（无人）';
+  R('handover_effective', `交接已生效：${COUNTER_FULL_NAME[h.counter]} ${fromName} → ${to.name}`, [
+    h.linkedSwap
+      ? `联动换岗完成：${to.name} 调守${COUNTER_FULL_NAME[h.counter]}，${volunteerById(state, h.fillVolunteerId!)?.name ?? '补位者'} 接手${COUNTER_FULL_NAME[otherCounter]}`
+      : '直接替补完成：新人自此刻起实际在岗',
+    ...(vacatedCounter
+      ? [`⚠ ${to.name} 原在${COUNTER_FULL_NAME[vacatedCounter]}在岗，调岗后该柜台暂停放号，需另找替补`]
+      : []),
+    '柜台恢复放号；原处于等待的预约在覆盖恢复后自动复原',
+  ]);
+  return undefined;
+}
+
+function hCancelHandover(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'CancelHandover' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const h = state.handovers.find((x) => x.id === cmd.handoverId);
+  if (!h) return '交接不存在';
+  if (h.status !== 'pending') return '只能取消待确认的交接';
+  h.status = 'cancelled';
+  R('handover_cancelled', `交接已取消：${COUNTER_FULL_NAME[h.counter]}`, ['柜台放号状态按当前实际在岗重新计算']);
+  return undefined;
+}
+
+function hCreateBooking(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'CreateBooking' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const counter = counterById(state, cmd.counter);
+  if (!counter) return '柜台不存在';
+  if (!cmd.residentRef.trim()) return '请填写居民编号或称谓';
+  if (cmd.slotEnd <= cmd.slotStart) return '预约时段结束须晚于开始';
+  if (!counterWindowContaining(counter, cmd.slotStart, cmd.slotEnd))
+    return `预约时段须落在${COUNTER_FULL_NAME[cmd.counter]}开放窗口内`;
+  const clash = state.bookings.find(
+    (b) =>
+      b.counter === cmd.counter &&
+      (b.status === 'booked' || b.status === 'waiting') &&
+      overlaps({ start: b.slotStart, end: b.slotEnd }, { start: cmd.slotStart, end: cmd.slotEnd }),
+  );
+  if (clash) return `该时段已有预约（${clash.residentRef}），不能重复放号`;
+  // 放号前以“实际覆盖”检验：只有实际在岗者才能承接名额
+  const covered = coversRange(actualIntervals(state, cmd.counter), cmd.slotStart, cmd.slotEnd);
+  const suspended =
+    state.handovers.some((h) => h.counter === cmd.counter && h.status === 'pending') ||
+    counterSuspended(state, cmd.counter, cmd.slotStart);
+  const b: Booking = {
+    id: uid(),
+    counter: cmd.counter,
+    slotStart: cmd.slotStart,
+    slotEnd: cmd.slotEnd,
+    residentRef: cmd.residentRef.trim(),
+    status: covered && !suspended ? 'booked' : 'waiting',
+    waitingReason: covered && !suspended ? undefined : suspended ? '[自动] 柜台暂停放号（无实际在岗或待确认接班）' : '[自动] 时段无实际在岗者覆盖',
+  };
+  state.bookings.push(b);
+  R(
+    'booking_created',
+    covered && !suspended
+      ? `已放号预约：${COUNTER_FULL_NAME[cmd.counter]} ${fmtSlot(cmd)} · ${b.residentRef}`
+      : `预约进入等待：${COUNTER_FULL_NAME[cmd.counter]} ${fmtSlot(cmd)} · ${b.residentRef}`,
+    [
+      covered && !suspended
+        ? '该时段有实际签到在岗者覆盖，可办理'
+        : `原因：${b.waitingReason}；名额不视为可办理，待覆盖恢复后自动复原`,
+      '名义排班不算数：只有实际签到在岗才开放名额',
+    ],
+  );
+  return undefined;
+}
+
+function hRescheduleBooking(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'RescheduleBooking' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const b = state.bookings.find((x) => x.id === cmd.bookingId);
+  if (!b) return '预约不存在';
+  if (b.status === 'served' || b.status === 'cancelled') return '该预约已结束，不能改约';
+  const counter = counterById(state, b.counter);
+  if (!counter) return '柜台不存在';
+  if (cmd.slotEnd <= cmd.slotStart) return '改约时段结束须晚于开始';
+  if (!counterWindowContaining(counter, cmd.slotStart, cmd.slotEnd))
+    return `改约时段须落在${COUNTER_FULL_NAME[b.counter]}开放窗口内`;
+  const clash = state.bookings.find(
+    (x) =>
+      x.id !== b.id &&
+      x.counter === b.counter &&
+      (x.status === 'booked' || x.status === 'waiting') &&
+      overlaps({ start: x.slotStart, end: x.slotEnd }, { start: cmd.slotStart, end: cmd.slotEnd }),
+  );
+  if (clash) return `目标时段已有预约（${clash.residentRef}）`;
+  const old = { start: b.slotStart, end: b.slotEnd };
+  b.slotStart = cmd.slotStart;
+  b.slotEnd = cmd.slotEnd;
+  b.wasRescheduled = true;
+  b.rescheduleNote = `已改约：${fmtRange(old)} → ${fmtSlot(cmd)}`;
+  b.status = 'booked';
+  b.waitingReason = undefined;
+  R('booking_rescheduled', `已改约：${b.residentRef} · ${COUNTER_FULL_NAME[b.counter]} ${fmtSlot(cmd)}`, [
+    `原时段 ${fmtRange(old)} 已释放`,
+    '改约后状态按新时段的实际覆盖自动重算',
+  ]);
+  return undefined;
+}
+
+function hCancelBooking(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'CancelBooking' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const b = state.bookings.find((x) => x.id === cmd.bookingId);
+  if (!b) return '预约不存在';
+  if (b.status === 'served') return '已办理的预约不能取消';
+  b.status = 'cancelled';
+  R('booking_cancelled', `预约已取消：${COUNTER_FULL_NAME[b.counter]} ${fmtSlot(b)} · ${b.residentRef}`, []);
+  return undefined;
+}
+
+function hServeBooking(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'ServeBooking' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const b = state.bookings.find((x) => x.id === cmd.bookingId);
+  if (!b) return '预约不存在';
+  if (b.status === 'served') return '该预约已办理';
+  if (b.status === 'cancelled') return '该预约已取消';
+  if (b.status === 'waiting') return `该预约处于等待（${(b.waitingReason ?? '').replace('[自动] ', '')}），不能按可办理处理；请先恢复覆盖或改约`;
+  const now = state.virtualNow;
+  if (now < b.slotStart) return '尚未到预约时段，不能提前办理';
+  if (now >= b.slotEnd) return '预约时段已过，请改约或取消';
+  const assignee = attendanceAt(state, b.counter, now);
+  if (!assignee) return `当前${COUNTER_FULL_NAME[b.counter]}无实际在岗者，不能办理（名义排班不算在岗）`;
+  if (counterSuspended(state, b.counter)) return `${COUNTER_FULL_NAME[b.counter]}正处于待确认接班/暂停放号状态，暂不能办理`;
+  b.status = 'served';
+  b.servedAt = now;
+  b.servedBy = assignee.volunteerId;
+  const name = volunteerById(state, assignee.volunteerId)?.name ?? assignee.volunteerId;
+  R('booking_served', `预约已办理：${b.residentRef} · ${COUNTER_FULL_NAME[b.counter]}（${name} 在岗办理）`, []);
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// 预约状态与覆盖同步（每次变更后调用）
+// ---------------------------------------------------------------------------
+
+const AUTO_PREFIX = '[自动] ';
+
+function setAutoStatus(b: Booking, status: BookingStatus, reason?: string) {
+  // 仅在非人工终态上自动切换
+  if (b.status === 'served' || b.status === 'cancelled') return;
+  b.status = status;
+  if (status === 'booked') {
+    if (b.waitingReason?.startsWith(AUTO_PREFIX)) b.waitingReason = undefined;
+  } else if (reason) {
+    b.waitingReason = AUTO_PREFIX + reason;
+  }
+}
+
+/**
+ * 预约只认“实际覆盖”：当前/未来时段的覆盖中断 → 转入等待（带原因）；
+ * 覆盖恢复且无待确认交接 → 自动复原为可办理。人工填写的等待原因不被自动覆盖。
+ */
+function syncBookings(state: ShelterState, R: ReceiptSink): void {
+  const now = state.virtualNow;
+  for (const b of state.bookings) {
+    if (b.status === 'served' || b.status === 'cancelled') continue;
+    if (b.slotEnd <= now) {
+      // 过期未办理：不自动宣称已办理；标记等待/失效，交由人工改约
+      if (b.status !== 'waiting') setAutoStatus(b, 'waiting', '时段已过且未办理，请改约或取消');
+      continue;
+    }
+    const suspended = state.handovers.some((h) => h.counter === b.counter && h.status === 'pending');
+    const covers = coversRange(actualIntervals(state, b.counter), b.slotStart, b.slotEnd);
+    if (suspended) {
+      if (b.status !== 'waiting' || !b.waitingReason?.includes('待确认接班')) {
+        const prev = b.status;
+        setAutoStatus(b, 'waiting', '柜台待确认接班，暂停放号');
+        if (prev !== 'waiting') {
+          R('booking_affected', `预约受影响：${COUNTER_FULL_NAME[b.counter]} ${fmtSlot(b)} · ${b.residentRef}`, [
+            '柜台有待确认接班，暂停放号；该预约不再显示“可办理”，转为等待',
+          ]);
+        }
+      }
+    } else if (!covers) {
+      if (b.status !== 'waiting' || !(b.waitingReason ?? '').startsWith(AUTO_PREFIX)) {
+        const prev = b.status;
+        setAutoStatus(b, 'waiting', '时段无实际在岗者覆盖');
+        if (prev !== 'waiting') {
+          R('booking_affected', `预约受影响：${COUNTER_FULL_NAME[b.counter]} ${fmtSlot(b)} · ${b.residentRef}`, [
+            '该时段实际覆盖中断（名义排班不算在岗），预约转为等待，请安排替补或改约',
+          ]);
+        }
+      }
+    } else if (
+      (b.status === 'waiting' || b.status === 'rescheduled') &&
+      (b.waitingReason ?? '').startsWith(AUTO_PREFIX)
+    ) {
+      const wasReason = b.waitingReason;
+      b.status = 'booked';
+      b.waitingReason = undefined;
+      R('booking_restored', `预约恢复可办理：${COUNTER_FULL_NAME[b.counter]} ${fmtSlot(b)} · ${b.residentRef}`, [
+        `覆盖已恢复（原等待原因：${wasReason?.replace(AUTO_PREFIX, '') ?? '—'}）`,
+      ]);
+    }
+  }
+}
+
+function hOpenCounterWindow(
+  state: ShelterState,
+  cmd: Extract<Command, { type: 'OpenCounterWindow' }>,
+  R: ReceiptSink,
+): string | undefined {
+  const counter = counterById(state, cmd.counter);
+  if (!counter) return '柜台不存在';
+  if (cmd.end <= cmd.start) return '开放窗口结束须晚于开始';
+  const clash = counter.windows.some((w) => overlaps(w, { start: cmd.start, end: cmd.end }));
+  if (clash) return '该时段与已有开放窗口重叠';
+  counter.windows.push({ start: cmd.start, end: cmd.end });
+  counter.windows.sort((a, b) => a.start - b.start);
+  R('counter_window_opened', `已开放柜台窗口：${COUNTER_FULL_NAME[cmd.counter]} ${fmtRange(cmd)}`, [
+    '新窗口需重新排班并签到后才可放号；跨日窗口按绝对时间区间检验',
+  ]);
+  return undefined;
 }

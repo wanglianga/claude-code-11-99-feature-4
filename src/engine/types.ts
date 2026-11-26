@@ -1,7 +1,7 @@
 /** 领域模型类型定义：避难所入住与返所工作台 */
 
-/** 操作角色：接待员 / 楼层值班员 / 床位管理员 */
-export type Role = 'receptionist' | 'duty' | 'bed_manager';
+/** 操作角色：接待员 / 楼层值班员 / 床位管理员 / 排班协调员 / 志愿者 */
+export type Role = 'receptionist' | 'duty' | 'bed_manager' | 'coordinator' | 'volunteer';
 
 /** 家庭当前状态（唯一位置口径） */
 export type FamilyStatus =
@@ -133,6 +133,141 @@ export interface CommandLogEntry {
   receiptIds: string[];
 }
 
+// ---------------------------------------------------------------------------
+// 柜台排班与开台（本次新增领域）
+// ---------------------------------------------------------------------------
+
+/** 柜台：A 接待柜台 / B 物资柜台 */
+export type CounterId = 'A' | 'B';
+
+export interface Counter {
+  id: CounterId;
+  name: string;
+  /** 开放窗口（可多个，支持跨日班次；绝对时间） */
+  windows: Interval[];
+}
+
+export interface Interval {
+  start: number;
+  end: number;
+}
+
+/** 志愿者：已核准岗位技能、登记可用时间与休息/临时任务区间 */
+export interface Volunteer {
+  id: string;
+  name: string;
+  skills: CounterId[];
+  /** 登记的可用时间窗（多个） */
+  available: Interval[];
+}
+
+/** 技能资格撤销区间（from 起失效；to 为恢复时间，未恢复则持续失效） */
+export interface SkillRevocation {
+  id: string;
+  volunteerId: string;
+  counter: CounterId;
+  from: number;
+  to?: number;
+}
+
+/** 休息 / 临时任务：同一志愿者在区间内不可排班 */
+export type BlockKind = 'rest' | 'task';
+
+export interface VolunteerBlock {
+  id: string;
+  volunteerId: string;
+  kind: BlockKind;
+  start: number;
+  end: number;
+  label: string;
+}
+
+export type ShiftKind = 'main' | 'relief';
+
+/** 计划班次：只描述“名义排班”，不等于实际在岗 */
+export interface Shift {
+  id: string;
+  volunteerId: string;
+  counter: CounterId;
+  start: number;
+  end: number;
+  kind: ShiftKind;
+  planId: string;
+  status: 'planned' | 'cancelled';
+}
+
+export type RosterStrategy = 'fixed_crossskilled' | 'short_shift' | 'manual';
+
+export interface RosterPlan {
+  id: string;
+  strategy: RosterStrategy;
+  windowStart: number;
+  windowEnd: number;
+  createdAt: number;
+  status: 'active' | 'cancelled';
+}
+
+/** 实际出勤：签到产生，离岗回执关闭；与班表调整相互独立 */
+export interface Attendance {
+  id: string;
+  volunteerId: string;
+  counter: CounterId;
+  signedInAt: number;
+  signedOutAt?: number;
+  /** 计划结束时刻（班次结束 / 接班替岗预计结束），实际覆盖不会超过它 */
+  plannedEndAt: number;
+  /** 签到对应的计划班次（无班次的接班替岗为空） */
+  shiftId?: string;
+  /** 签到是否晚于班次开始 */
+  lateSignIn?: boolean;
+  /** 离岗回执是否晚到 */
+  lateReport?: boolean;
+  /** 离岗回执到达时间（真实业务时间的到达时刻，用于说明晚到） */
+  reportedAt?: number;
+  signOutNote?: string;
+}
+
+export type HandoverStatus = 'pending' | 'effective' | 'cancelled' | 'superseded';
+
+/** 交接：双方确认后生效；生效前柜台暂停放号 */
+export interface Handover {
+  id: string;
+  counter: CounterId;
+  /** 交班人（离岗者）；空表示柜台已无人、安排直接替补 */
+  fromVolunteerId?: string;
+  toVolunteerId: string;
+  /** 联动换岗：接班人原在另一柜台，同时由 fillVolunteerId 补入该柜台 */
+  linkedSwap: boolean;
+  /** 联动换岗时为原柜台安排的补位者 */
+  fillVolunteerId?: string;
+  requestedAt: number;
+  status: HandoverStatus;
+  outgoingConfirmedAt?: number;
+  incomingConfirmedAt?: number;
+  effectiveAt?: number;
+  supersededBy?: string;
+  note?: string;
+}
+
+export type BookingStatus = 'booked' | 'waiting' | 'rescheduled' | 'served' | 'cancelled';
+
+/** 预约：只有在相应时段有“实际在岗且技能有效者”时才可放号/可办理 */
+export interface Booking {
+  id: string;
+  counter: CounterId;
+  slotStart: number;
+  slotEnd: number;
+  residentRef: string;
+  status: BookingStatus;
+  waitingReason?: string;
+  /** 是否发生过改约（用于页面显示“改约”标签） */
+  wasRescheduled?: boolean;
+  /** 改约说明（如“15:10–15:30 → 15:30–15:50”） */
+  rescheduleNote?: string;
+  servedAt?: number;
+  servedBy?: string;
+}
+
 export interface ShelterState {
   version: number;
   /** 演示用虚拟时钟（业务时间，如承诺到期的判定依据） */
@@ -146,6 +281,16 @@ export interface ShelterState {
   pending: PendingConfirmation[];
   commandLog: CommandLogEntry[];
   seqCounter: number;
+  // ---- 柜台排班与开台 ----
+  counters: Counter[];
+  volunteers: Volunteer[];
+  blocks: VolunteerBlock[];
+  skillRevocations: SkillRevocation[];
+  plans: RosterPlan[];
+  shifts: Shift[];
+  attendances: Attendance[];
+  handovers: Handover[];
+  bookings: Booking[];
 }
 
 export type Command =
@@ -162,11 +307,70 @@ export type Command =
   | { type: 'ReopenRoom'; commandId: string; roomId: string }
   | { type: 'AdvanceClock'; commandId: string; toVirtual: number }
   | { type: 'ResetDemo'; commandId: string }
-  | { type: 'FinalizeDue'; commandId: string };
+  | { type: 'FinalizeDue'; commandId: string }
+  // ---- 排班与开台 ----
+  | {
+      type: 'RegisterVolunteer';
+      commandId: string;
+      input: { name: string; skills: CounterId[]; available: Interval[] };
+    }
+  | {
+      type: 'AddVolunteerBlock';
+      commandId: string;
+      volunteerId: string;
+      kind: BlockKind;
+      start: number;
+      end: number;
+      label: string;
+    }
+  | { type: 'RevokeSkill'; commandId: string; volunteerId: string; counter: CounterId; at?: number }
+  | { type: 'RestoreSkill'; commandId: string; volunteerId: string; counter: CounterId; at?: number }
+  | {
+      type: 'GenerateRoster';
+      commandId: string;
+      strategy: Exclude<RosterStrategy, 'manual'>;
+      windowStart: number;
+      windowEnd: number;
+    }
+  | {
+      type: 'ManualAssignShift';
+      commandId: string;
+      volunteerId: string;
+      counter: CounterId;
+      start: number;
+      end: number;
+    }
+  | { type: 'OpenCounterWindow'; commandId: string; counter: CounterId; start: number; end: number }
+  | { type: 'CancelShift'; commandId: string; shiftId: string }
+  | { type: 'SignIn'; commandId: string; volunteerId: string; counter: CounterId; at?: number }  | {
+      type: 'SignOut';
+      commandId: string;
+      attendanceId: string;
+      at: number;
+      reportedAt?: number;
+      note?: string;
+    }
+  | {
+      type: 'RequestHandover';
+      commandId: string;
+      counter: CounterId;
+      toVolunteerId: string;
+      linkedSwap: boolean;
+      /** 联动换岗时的补位者（不填则仅把人移过来、原柜台暂停） */
+      fillVolunteerId?: string;
+    }
+  | { type: 'ConfirmHandover'; commandId: string; handoverId: string; side: 'outgoing' | 'incoming' }
+  | { type: 'CancelHandover'; commandId: string; handoverId: string }
+  | { type: 'CreateBooking'; commandId: string; counter: CounterId; slotStart: number; slotEnd: number; residentRef: string }
+  | { type: 'RescheduleBooking'; commandId: string; bookingId: string; slotStart: number; slotEnd: number }
+  | { type: 'CancelBooking'; commandId: string; bookingId: string }
+  | { type: 'ServeBooking'; commandId: string; bookingId: string };
 
 export interface CmdCtx {
   role: Role;
   realNow: number;
+  /** 志愿者角色操作时代表的具体志愿者（用于约束本人签到 / 确认） */
+  volunteerId?: string;
 }
 
 export interface CmdOutcome {

@@ -26,16 +26,16 @@ interface CmdResultView {
   changed: boolean;
 }
 
-async function runInTx(cmd: Command, role: Role): Promise<CmdOutcome> {
+async function runInTx(cmd: Command, role: Role, volunteerId?: string): Promise<CmdOutcome> {
   const realNow = Date.now();
   return transact((s) => {
-    const r = applyCommand(s, cmd, { role, realNow });
+    const r = applyCommand(s, cmd, { role, realNow, volunteerId });
     return r.changed ? { state: r.state, out: r } : { out: r };
   });
 }
 
-async function handleCmd(cmd: Command, role: Role): Promise<CmdResultView> {
-  const out = await runInTx(cmd, role);
+async function handleCmd(cmd: Command, role: Role, volunteerId?: string): Promise<CmdResultView> {
+  const out = await runInTx(cmd, role, volunteerId);
   if (out.changed) bc.postMessage({ type: 'invalidate', version: out.state.version });
   return { ok: !out.error, error: out.error, receipts: out.receipts, changed: out.changed };
 }
@@ -55,11 +55,11 @@ async function sweep() {
 }
 
 ctx.onmessage = async (e: MessageEvent) => {
-  const data = e.data as { reqId: number; kind: string; cmd?: Command; role?: Role };
+  const data = e.data as { reqId: number; kind: string; cmd?: Command; role?: Role; volunteerId?: string };
   const { reqId, kind } = data;
   try {
     if (kind === 'cmd') {
-      const result = await handleCmd(data.cmd as Command, data.role as Role);
+      const result = await handleCmd(data.cmd as Command, data.role as Role, data.volunteerId);
       ctx.postMessage({ reqId, result });
     } else if (kind === 'getState') {
       const state = await readState();

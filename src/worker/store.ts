@@ -32,7 +32,7 @@ export async function transact<T>(
   const tx = db.transaction(STORE, 'readwrite');
   const store = tx.objectStore(STORE);
   const raw = (await store.get(KEY)) as ShelterState | undefined;
-  const result = fn(raw ?? seedState());
+  const result = fn(normalize(raw ?? seedState()));
   if (result.state) await store.put(result.state, KEY);
   await tx.done;
   return result.out;
@@ -41,5 +41,26 @@ export async function transact<T>(
 export async function readState(): Promise<ShelterState> {
   const db = await getDb();
   const raw = (await db.get(STORE, KEY)) as ShelterState | undefined;
-  return raw ?? seedState();
+  return normalize(raw ?? seedState());
+}
+
+/**
+ * 旧版本本地数据缺少柜台排班字段时补齐默认值（不丢家庭/床位数据）。
+ * 若完全没有柜台/志愿者数据，则从种子中取柜台与志愿者定义，其余保持原状。
+ */
+function normalize(s: ShelterState): ShelterState {
+  const seed = seedState();
+  const patched: ShelterState = {
+    ...s,
+    counters: s.counters ?? seed.counters,
+    volunteers: s.volunteers ?? seed.volunteers,
+    blocks: s.blocks ?? [],
+    skillRevocations: s.skillRevocations ?? [],
+    plans: s.plans ?? [],
+    shifts: s.shifts ?? [],
+    attendances: s.attendances ?? [],
+    handovers: s.handovers ?? [],
+    bookings: s.bookings ?? [],
+  };
+  return patched;
 }
